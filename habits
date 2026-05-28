@@ -142,13 +142,20 @@ def cmd_link(args):
         print("  Usage: habits link <agent_secret>")
         print("  Get the code from app: Settings → Link Agent")
         return
-    # Save and verify
+    # Save secret first (so _headers includes it)
     _save_user(None, None, secret)
+    # Look up user_id and device_id from device_links
     try:
-        habits = _get(f"habits?select=id&limit=1")
-        print(f"  Linked! Found {len(habits)} habit(s).")
+        links = _get("device_links?select=user_id,instance_id&limit=1")
+        if links:
+            _save_user(links[0].get("user_id"), links[0].get("instance_id"), secret)
+            print(f"  Linked! user_id={links[0].get('user_id', '?')[:8]}...")
+        else:
+            print(f"  Linked (could not resolve user info).")
+        habits = _get(f"habits?id=gt.0&select=id&limit=1")
+        print(f"  Found {len(habits)} habit(s).")
     except Exception as e:
-        print(f"  Warning: could not verify ({e}). Check the code and try again.")
+        print(f"  Warning: could not verify ({e}). Check the code.")
 
 
 def cmd_whoami(args):
