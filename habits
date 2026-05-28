@@ -23,7 +23,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -31,35 +30,32 @@ from urllib.error import HTTPError
 # --- Config ---
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
-_env_path = os.path.join(_script_dir, ".env")
 _user_path = os.path.join(_script_dir, ".user")
 
-if os.path.exists(_env_path):
-    for line in open(_env_path):
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
-
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("Error: Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env")
-    print("       Copy .env.example and fill in values.")
-    sys.exit(1)
+SUPABASE_URL = "https://vzhkkxqwqtqajnutpjmt.supabase.co"
+SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ6aGtreHF3cXRxYWpudXRwam10Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4NTI2MjUsImV4cCI6MjA5NDQyODYyNX0.rRW-MGdghQk2yyPlwmBeCLvgZqIt9IApgVSg-PjSouE"
 
 REST = f"{SUPABASE_URL}/rest/v1"
 
 
 # --- HTTP ---
 
+def _agent_secret():
+    user = _load_user()
+    if user and user.get("agent_secret"):
+        return user["agent_secret"]
+    return None
+
+
 def _headers(extra=None):
     h = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
         "Content-Type": "application/json",
     }
+    secret = _agent_secret()
+    if secret:
+        h["x-agent-secret"] = secret
     if extra:
         h.update(extra)
     return h
@@ -78,19 +74,22 @@ def _post(path, data, extra_headers=None):
         return json.loads(resp.read())
 
 
-def _rpc(fn, params):
-    body = json.dumps(params).encode()
-    req = Request(f"{REST}/rpc/{fn}", data=body, headers=_headers())
-    with urlopen(req) as resp:
-        return json.loads(resp.read())
-
-
 # --- User ---
 
-def _save_user(user_id, device_id):
+def _save_user(user_id, device_id, agent_secret=None):
+    data = {}
+    if os.path.exists(_user_path):
+        with open(_user_path) as f:
+            data = json.load(f)
+    if user_id:
+        data["user_id"] = user_id
+    if device_id:
+        data["device_id"] = device_id
+    if agent_secret:
+        data["agent_secret"] = agent_secret
     fd = os.open(_user_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        json.dump({"user_id": user_id, "device_id": device_id}, f)
+        json.dump(data, f)
 
 
 def _load_user():
@@ -102,8 +101,9 @@ def _load_user():
 
 def _require_user():
     user = _load_user()
-    if not user:
-        print("Not linked. Run 'habits link' first.")
+    if not user or not user.get("agent_secret"):
+        print("Not linked. Run 'habits link <code>' first.")
+        print("Get the code from app: Settings → Link Agent")
         sys.exit(1)
     return user
 
@@ -117,10 +117,9 @@ def _user_device_id():
 
 
 def _user_filter():
-    user = _require_user()
-    if user.get("user_id"):
-        return f"user_id=eq.{user['user_id']}"
-    return f"device_id=eq.{user['device_id']}"
+    """RLS handles filtering via x-agent-secret header. Return minimal filter."""
+    _require_user()  # just verify linked
+    return "id=gt.0"  # no-op filter, RLS does the real scoping
 
 
 def _resolve_habit(name):
@@ -137,44 +136,19 @@ def _resolve_habit(name):
 # --- Commands ---
 
 def cmd_link(args):
-    if args.device_id:
-        device_id = args.device_id
-    else:
-        habits = _get("habits?select=device_id,synced_at&order=synced_at.desc")
-        seen = {}
-        for h in habits:
-            did = h["device_id"]
-            if did not in seen:
-                seen[did] = h["synced_at"]
-        if not seen:
-            print("No device found. Sync the app first.")
-            return
-        if len(seen) == 1:
-            device_id = list(seen.keys())[0]
-        else:
-            print("  Multiple devices found:")
-            for i, (did, synced) in enumerate(seen.items()):
-                print(f"    [{i}] {did[:12]}... (synced: {synced})")
-            print(f"  Run: habits link <device_id>")
-            return
-
-    token = _rpc("create_device_link", {"p_instance_id": device_id})
-    print(f"  Link token: {token}")
-    print(f"  Enter this in the app: Settings → Link Agent")
-    print(f"  Expires in 15 minutes.")
-    print()
-    print("  Waiting for claim...", end="", flush=True)
-    for _ in range(90):
-        time.sleep(10)
-        print(".", end="", flush=True)
-        links = _get(f"device_links?token=eq.{token}&select=user_id,used")
-        if links and links[0].get("used"):
-            user_id = links[0].get("user_id")
-            if user_id:
-                _save_user(user_id, device_id)
-                print(f"\n  Linked! user_id={user_id[:8]}...")
-                return
-    print("\n  Token expired. Try again.")
+    """Store the agent secret from the app."""
+    secret = args.secret
+    if not secret:
+        print("  Usage: habits link <agent_secret>")
+        print("  Get the code from app: Settings → Link Agent")
+        return
+    # Save and verify
+    _save_user(None, None, secret)
+    try:
+        habits = _get(f"habits?select=id&limit=1")
+        print(f"  Linked! Found {len(habits)} habit(s).")
+    except Exception as e:
+        print(f"  Warning: could not verify ({e}). Check the code and try again.")
 
 
 def cmd_whoami(args):
@@ -360,8 +334,8 @@ def main():
     parser = argparse.ArgumentParser(prog="habits", description="HabitLoop agent skill")
     sub = parser.add_subparsers(dest="command")
 
-    p = sub.add_parser("link", help="Link to a user")
-    p.add_argument("device_id", nargs="?", default=None)
+    p = sub.add_parser("link", help="Link with agent code from app")
+    p.add_argument("secret", nargs="?", default=None, help="Agent code from app")
 
     sub.add_parser("whoami", help="Show linked user")
     sub.add_parser("list", help="List habits")

@@ -2,9 +2,12 @@
 
 습관 데이터를 읽고 쓰는 agent skill.
 
-## Setup
+## 첫 사용 시
 
-`.env.example`을 `.env`로 복사하고 credentials 입력. 그 후 `python3 habits link`로 사용자 연결.
+`.user` 파일이 없으면 사용자에게 앱에서 코드를 받아오라고 안내:
+1. 앱 Settings → Sign in with Google
+2. Settings → Link Agent → 코드 복사
+3. `python3 habits link <코드>`
 
 ## 사용자가 습관 관련 요청 시
 
