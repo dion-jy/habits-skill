@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""
+HabitLoop Skill — Read/write habit data via Supabase.
+
+Setup:
+  1. Copy .env.example to .env and fill in credentials
+  2. Run: habits link
+  3. Enter token in app: Settings → Link Agent
+
+Usage:
+  habits list              # 습관 목록
+  habits summary           # streak/완료 통계
+  habits entries [--days N] # 최근 기록
+  habits check <name> YES  # 체크 (부분 매치)
+  habits check <name> NO   # 언체크
+  habits status            # 앱 vs DB 상태
+  habits coach "메시지"     # 코칭 메시지
+  habits link              # device 연결
+  habits whoami            # 연결 정보
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+
+# --- Config ---
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_env_path = os.path.join(_script_dir, ".env")
+_user_path = os.path.join(_script_dir, ".user")
+
+if os.path.exists(_env_path):
+    for line in open(_env_path):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("Error: Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env")
+    print("       Copy .env.example and fill in values.")
+    sys.exit(1)
+
+REST = f"{SUPABASE_URL}/rest/v1"
+
+
+# --- HTTP ---
+
+def _headers(extra=None):
+    h = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if extra:
+        h.update(extra)
+    return h
+
+
+def _get(path):
+    req = Request(f"{REST}/{path}", headers=_headers())
+    with urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def _post(path, data, extra_headers=None):
+    body = json.dumps(data).encode()
+    req = Request(f"{REST}/{path}", data=body, headers=_headers(extra_headers))
+    with urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def _rpc(fn, params):
+    body = json.dumps(params).encode()
+    req = Request(f"{REST}/rpc/{fn}", data=body, headers=_headers())
+    with urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+# --- User ---
+
+def _save_user(user_id, device_id):
+    fd = os.open(_user_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"user_id": user_id, "device_id": device_id}, f)
+
+
+def _load_user():
+    if not os.path.exists(_user_path):
+        return None
+    with open(_user_path) as f:
+        return json.load(f)
+
+
+def _require_user():
+    user = _load_user()
+    if not user:
+        print("Not linked. Run 'habits link' first.")
+        sys.exit(1)
+    return user
+
+
+def _user_id():
+    return _require_user()["user_id"]
+
+
+def _user_device_id():
+    return _require_user()["device_id"]
+
+
+def _user_filter():
+    user = _require_user()
+    if user.get("user_id"):
+        return f"user_id=eq.{user['user_id']}"
+    return f"device_id=eq.{user['device_id']}"
+
+
+def _resolve_habit(name):
+    habits = _get(f"habits?{_user_filter()}&select=id,name,device_id")
+    for h in habits:
+        if h["name"].lower() == name.lower():
+            return h
+    for h in habits:
+        if name.lower() in h["name"].lower():
+            return h
+    return None
+
+
+# --- Commands ---
+
+def cmd_link(args):
+    if args.device_id:
+        device_id = args.device_id
+    else:
+        habits = _get("habits?select=device_id,synced_at&order=synced_at.desc")
+        seen = {}
+        for h in habits:
+            did = h["device_id"]
+            if did not in seen:
+                seen[did] = h["synced_at"]
+        if not seen:
+            print("No device found. Sync the app first.")
+            return
+        if len(seen) == 1:
+            device_id = list(seen.keys())[0]
+        else:
+            print("  Multiple devices found:")
+            for i, (did, synced) in enumerate(seen.items()):
+                print(f"    [{i}] {did[:12]}... (synced: {synced})")
+            print(f"  Run: habits link <device_id>")
+            return
+
+    token = _rpc("create_device_link", {"p_instance_id": device_id})
+    print(f"  Link token: {token}")
+    print(f"  Enter this in the app: Settings → Link Agent")
+    print(f"  Expires in 15 minutes.")
+    print()
+    print("  Waiting for claim...", end="", flush=True)
+    for _ in range(90):
+        time.sleep(10)
+        print(".", end="", flush=True)
+        links = _get(f"device_links?token=eq.{token}&select=user_id,used")
+        if links and links[0].get("used"):
+            user_id = links[0].get("user_id")
+            if user_id:
+                _save_user(user_id, device_id)
+                print(f"\n  Linked! user_id={user_id[:8]}...")
+                return
+    print("\n  Token expired. Try again.")
+
+
+def cmd_whoami(args):
+    user = _load_user()
+    if not user:
+        print("  Not linked. Run 'habits link' first.")
+        return
+    print(f"  user_id:   {user['user_id']}")
+    print(f"  device_id: {user['device_id']}")
+    habits = _get(f"habits?{_user_filter()}&select=synced_at&order=synced_at.desc&limit=1")
+    if habits:
+        print(f"  last sync: {habits[0]['synced_at']}")
+
+
+def cmd_list(args):
+    habits = _get(f"habits?{_user_filter()}&order=position.asc")
+    if not habits:
+        print("No habits.")
+        return
+    for h in habits:
+        status = " (archived)" if h["archived"] else ""
+        freq = f"{h['freq_num']}/{h['freq_den']}"
+        kind = "num" if h["type"] == 1 else "bool"
+        print(f"  {h['name']:<25} {kind:<5} {freq}{status}")
+
+
+def cmd_entries(args):
+    uf = _user_filter()
+    days = args.days
+    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+    entries = _get(f"entries?{uf}&timestamp=gte.{cutoff_ms}&order=timestamp.desc")
+    if not entries:
+        print(f"No entries in last {days} days.")
+        return
+    habits = _get(f"habits?{uf}&select=id,name")
+    name_map = {h["id"]: h["name"] for h in habits}
+    val_map = {2: "YES", 1: "AUTO", 0: "NO", 3: "SKIP"}
+    for e in entries:
+        dt = datetime.fromtimestamp(e["timestamp"] / 1000, tz=timezone.utc)
+        name = name_map.get(e["habit_id"], f"id={e['habit_id']}")
+        val = val_map.get(e["value"], str(e["value"]))
+        notes = f" — {e['notes']}" if e.get("notes") else ""
+        src = " [agent]" if e.get("source") == "agent" else ""
+        print(f"  {dt:%Y-%m-%d} {name:<20} {val}{notes}{src}")
+
+
+def cmd_summary(args):
+    uf = _user_filter()
+    habits = _get(f"habits?{uf}&order=position.asc")
+    if not habits:
+        print("No habits.")
+        return
+    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=90)).timestamp() * 1000)
+    entries = _get(f"entries?{uf}&timestamp=gte.{cutoff_ms}&order=timestamp.desc")
+
+    by_habit = {}
+    for e in entries:
+        by_habit.setdefault(e["habit_id"], []).append(e)
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    day_ms = 86400 * 1000
+
+    print(f"  {'Habit':<25} {'7d':>4} {'30d':>5} {'Streak':>7}")
+    print("  " + "-" * 44)
+
+    for h in habits:
+        if h["archived"]:
+            continue
+        es = by_habit.get(h["id"], [])
+        completed = [e for e in es if e["value"] in (1, 2)]
+        last_7 = sum(1 for e in completed if now_ms - e["timestamp"] < 7 * day_ms)
+        last_30 = sum(1 for e in completed if now_ms - e["timestamp"] < 30 * day_ms)
+
+        streak = 0
+        if completed:
+            day_set = {e["timestamp"] // day_ms for e in completed}
+            today_day = now_ms // day_ms
+            for i in range(90):
+                if (today_day - i) in day_set:
+                    streak += 1
+                else:
+                    break
+
+        print(f"  {h['name']:<25} {last_7:>4} {last_30:>5} {streak:>7}")
+
+
+def cmd_check(args):
+    value_str = args.value.upper()
+    date_str = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    val_map = {"YES": 2, "NO": 0, "SKIP": 3}
+    if value_str in val_map:
+        value = val_map[value_str]
+    else:
+        try:
+            value = int(value_str)
+        except ValueError:
+            print(f"Invalid value: {value_str}. Use YES/NO/SKIP or integer.")
+            return
+
+    habit = _resolve_habit(args.habit)
+    if not habit:
+        print(f"Habit '{args.habit}' not found.")
+        return
+
+    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    timestamp_ms = int(dt.timestamp() * 1000)
+
+    user = _require_user()
+    _post(
+        "entries?on_conflict=device_id,habit_id,timestamp",
+        {
+            "device_id": habit["device_id"],
+            "habit_id": habit["id"],
+            "timestamp": timestamp_ms,
+            "value": value,
+            "notes": args.notes or "",
+            "source": "agent",
+            "user_id": user.get("user_id"),
+        },
+        {"Prefer": "return=representation,resolution=merge-duplicates"},
+    )
+    print(f"  {habit['name']} = {value_str} on {date_str}")
+
+
+def cmd_status(args):
+    user = _require_user()
+    device_id = user["device_id"]
+
+    hb_list = _get(f"device_heartbeat?device_id=eq.{device_id}")
+    if not hb_list:
+        print("  No heartbeat. App has never reported its state.")
+        return
+
+    hb = hb_list[0]
+    uf = _user_filter()
+    sb_habits = _get(f"habits?{uf}&select=id")
+    sb_entries = _get(f"entries?{uf}&select=id")
+
+    app_h = hb["habit_count"]
+    app_e = hb["entry_count"]
+    db_h = len(sb_habits)
+    db_e = len(sb_entries)
+    last_seen = hb["last_seen_at"]
+
+    print(f"  Device:    {device_id[:12]}...")
+    print(f"  App ver:   {hb.get('app_version', '?')}")
+    print(f"  Last seen: {last_seen}")
+    print()
+    print(f"  {'':15} {'App':>6} {'DB':>6} {'Status':>8}")
+    print(f"  {'':15} {'---':>6} {'---':>6} {'------':>8}")
+    print(f"  {'Habits':15} {app_h:>6} {db_h:>6} {'OK' if app_h == db_h else 'DIFF':>8}")
+    print(f"  {'Entries':15} {app_e:>6} {db_e:>6} {'OK' if app_e == db_e else 'DIFF':>8}")
+
+    last_dt = datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
+    age = datetime.now(timezone.utc) - last_dt
+    hours = age.total_seconds() / 3600
+    if hours > 1:
+        print(f"\n  WARNING: App last seen {hours:.1f}h ago")
+    if db_h > 0 and app_h == 0:
+        print(f"\n  ALERT: DB has {db_h} habits but app has 0 — likely reinstalled")
+
+
+def cmd_coach(args):
+    user = _require_user()
+    data = {
+        "device_id": _user_device_id(),
+        "user_id": user.get("user_id"),
+        "message": args.message,
+        "type": args.type,
+    }
+    if args.habit:
+        habit = _resolve_habit(args.habit)
+        if habit:
+            data["habit_uuid"] = _get(
+                f"habits?{_user_filter()}&id=eq.{habit['id']}&select=uuid"
+            )[0].get("uuid")
+    result = _post("coaching", data, {"Prefer": "return=representation"})
+    print(f"  Coaching sent (id={result[0]['id']})")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="habits", description="HabitLoop agent skill")
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("link", help="Link to a user")
+    p.add_argument("device_id", nargs="?", default=None)
+
+    sub.add_parser("whoami", help="Show linked user")
+    sub.add_parser("list", help="List habits")
+
+    p = sub.add_parser("entries", help="Recent entries")
+    p.add_argument("--days", type=int, default=7)
+
+    sub.add_parser("summary", help="Streak & completion stats")
+    sub.add_parser("status", help="App vs DB sync status")
+
+    p = sub.add_parser("check", help="Check/uncheck a habit")
+    p.add_argument("habit", help="Habit name (partial match OK)")
+    p.add_argument("value", help="YES / NO / SKIP / integer")
+    p.add_argument("--date", default=None, help="YYYY-MM-DD")
+    p.add_argument("--notes", default=None)
+
+    p = sub.add_parser("coach", help="Send coaching message")
+    p.add_argument("message")
+    p.add_argument("--type", default="nudge", choices=["nudge", "insight", "celebration"])
+    p.add_argument("--habit", default=None)
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return
+
+    cmds = {
+        "link": cmd_link, "whoami": cmd_whoami, "list": cmd_list,
+        "entries": cmd_entries, "summary": cmd_summary, "status": cmd_status,
+        "check": cmd_check, "coach": cmd_coach,
+    }
+    cmds[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
