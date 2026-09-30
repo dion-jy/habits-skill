@@ -67,6 +67,24 @@ def _get(path):
         return json.loads(resp.read())
 
 
+def _get_all(path, page=1000):
+    """PostgREST max-rows=1000 상한 → limit/offset 페이지네이션 (path에 id 포함 order 필수)."""
+    out, off = [], 0
+    while True:
+        b = _get(f"{path}&limit={page}&offset={off}")
+        out += b
+        off += page
+        if len(b) < page:
+            return out
+
+
+def _count(path):
+    """행 수만 (Content-Range 헤더). 전체를 받아 len() 하면 1000에서 잘린다."""
+    req = Request(f"{REST}/{path}&limit=1", headers=_headers({"Prefer": "count=exact"}))
+    with urlopen(req) as resp:
+        return int(resp.headers["Content-Range"].split("/")[-1])
+
+
 def _post(path, data, extra_headers=None):
     body = json.dumps(data).encode()
     req = Request(f"{REST}/{path}", data=body, headers=_headers(extra_headers))
@@ -186,7 +204,7 @@ def cmd_entries(args):
     uf = _user_filter()
     days = args.days
     cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
-    entries = _get(f"entries?{uf}&timestamp=gte.{cutoff_ms}&order=timestamp.desc")
+    entries = _get_all(f"entries?{uf}&timestamp=gte.{cutoff_ms}&order=timestamp.desc,id.desc")
     if not entries:
         print(f"No entries in last {days} days.")
         return
@@ -209,7 +227,7 @@ def cmd_summary(args):
         print("No habits.")
         return
     cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=90)).timestamp() * 1000)
-    entries = _get(f"entries?{uf}&timestamp=gte.{cutoff_ms}&order=timestamp.desc")
+    entries = _get_all(f"entries?{uf}&timestamp=gte.{cutoff_ms}&order=timestamp.desc,id.desc")
 
     by_habit = {}
     for e in entries:
@@ -294,12 +312,11 @@ def cmd_status(args):
     hb = hb_list[0]
     uf = _user_filter()
     sb_habits = _get(f"habits?{uf}&select=id")
-    sb_entries = _get(f"entries?{uf}&select=id")
+    db_e = _count(f"entries?{uf}&select=id")
 
     app_h = hb["habit_count"]
     app_e = hb["entry_count"]
     db_h = len(sb_habits)
-    db_e = len(sb_entries)
     last_seen = hb["last_seen_at"]
 
     print(f"  Device:    {device_id[:12]}...")
